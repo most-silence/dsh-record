@@ -224,19 +224,19 @@ const StopIcon = () => (
 
 function RecordButton(props: SessionProps) {
   const { sessionId } = props
-  const [phase, setPhase] = useState<Phase>('idle')
+  const [phase, setPhase] = useState('idle' as Phase)
   const [elapsed, setElapsed] = useState(0)
-  const [note, setNote] = useState<{ text: string; tone: 'err' | 'ok' } | null>(null)
+  const [note, setNote] = useState(null as { text: string; tone: 'err' | 'ok' } | null)
   const [liveName, setLiveName] = useState('')
 
-  const streamRef = useRef<any>(null)
-  const recorderRef = useRef<any>(null)
-  const chunksRef = useRef<Blob[]>([])
+  const streamRef = useRef(null as any)
+  const recorderRef = useRef(null as any)
+  const chunksRef = useRef([] as Blob[])
   const startRef = useRef(0)
   const mimeRef = useRef('')
   const cancelRef = useRef(false)
-  const timerRef = useRef<any>(null)
-  const noteTimerRef = useRef<any>(null)
+  const timerRef = useRef(null as any)
+  const noteTimerRef = useRef(null as any)
   const attachedRef = useRef(false)
   const startingRef = useRef(false)
   const disposedRef = useRef(false)
@@ -444,8 +444,8 @@ function RecordButton(props: SessionProps) {
 
   const recording = phase === 'recording' || phase === 'stopping'
   const seatTitle = recording
-    ? liveName ? `停止并处理为 ${liveName}（Esc 取消）` : '停止录音并处理（Esc 取消）'
-    : '录音并附加到当前输入框'
+    ? liveName ? `Stop & save as ${liveName}（Esc 取消）` : 'Stop / 停止（Esc 取消）'
+    : 'Record / 录音'
 
   return (
     <span {...{ 'data-dsh-record-seat': '' }}>

@@ -31,9 +31,9 @@ export interface Config extends Record<string, unknown> {
 }
 
 export const Config: z<Config> = z.object({
-  format: z.enum(['mp3', 'wav', 'webm']).default('mp3')
+  format: z.union(['mp3', 'wav', 'webm']).default('mp3')
     .description('录音文件格式：mp3（默认，浏览器端用 lamejs 转码）/ wav（无损）/ webm（浏览器原生 Opus，不转码）。'),
-  saveMode: z.enum(['workspace', 'custom', 'off']).default('workspace')
+  saveMode: z.union(['workspace', 'custom', 'off']).default('workspace')
     .description('录音保存位置：workspace = 当前项目空间根目录下的 recordings/；custom = 使用下方自定义目录；off = 不落盘，只作为会话附件。'),
   saveDir: z.string().default('')
     .description('自定义保存目录（saveMode = custom 时生效），需为绝对路径，例如 D:\\Recordings。'),

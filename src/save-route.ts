@@ -31,8 +31,8 @@ export function readBody(req: { on(event: string, cb: (chunk?: Buffer | Error) =
     const chunks: Buffer[] = []
     let size = 0
     let exceeded = false
-    req.on('data', (chunk: Buffer) => {
-      if (exceeded) return
+    req.on('data', (chunk?: Buffer | Error) => {
+      if (exceeded || !(chunk instanceof Uint8Array)) return
       size += chunk.length
       if (size > maxBytes) {
         exceeded = true
@@ -44,8 +44,8 @@ export function readBody(req: { on(event: string, cb: (chunk?: Buffer | Error) =
     req.on('end', () => {
       if (!exceeded) resolvePromise(Buffer.concat(chunks))
     })
-    req.on('error', (err: Error) => {
-      if (!exceeded) reject(err)
+    req.on('error', (err?: Buffer | Error) => {
+      if (!exceeded && err instanceof Error) reject(err)
     })
   })
 }
