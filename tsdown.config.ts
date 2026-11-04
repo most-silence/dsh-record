@@ -35,6 +35,9 @@ export default [
       // `Config` schema and must see its own instance; cordis is type-only here.
       neverBundle: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
     },
+    // tsdown 0.19 ignores deps.neverBundle for the node entry; `external`
+    // is the option that actually keeps schemastery as a runtime import.
+    external: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
   },
   {
     // Browser bundle: lib/client.js, served by the harness at /plugins/dsh-record/client.js.
