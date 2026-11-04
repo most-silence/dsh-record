@@ -1,0 +1,5 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+# Client-only plugin: the node half is a no-op; behavior lives in lib/client.js.
+- insert:
+    - id: dsh-record
+      name: 'dsh-record'
