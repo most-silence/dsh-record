@@ -314,10 +314,10 @@ function RecordButton(props: SessionProps) {
     mimeRef.current = mime
     let recorder: any
     try {
-      recorder = new MR(stream, mime ? { mimeType: mime } : undefined)
+      recorder = new MR(stream, mime ? { mimeType: mime, audioBitsPerSecond: 16000 } : { audioBitsPerSecond: 16000 })
     } catch {
       try {
-        recorder = new MR(stream)
+        recorder = new MR(stream, { audioBitsPerSecond: 16000 })
       } catch (err: any) {
         startingRef.current = false
         releaseMic()
