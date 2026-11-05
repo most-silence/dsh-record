@@ -1,7 +1,7 @@
 {
   "name": "dsh-record",
-  "version": "0.2.0",
-  "description": "Composer microphone button that records audio, attaches it to the current prompt, and saves the file as MP3 (default), WAV, or native WebM to the workspace recordings/ directory or a custom folder.",
+  "version": "0.2.1",
+  "description": "Composer microphone button: record audio and attach it to the current prompt as a conversation file attachment.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -21,6 +21,7 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.zh.md",
     "LICENSE"
   ],
   "engines": {
@@ -56,13 +57,7 @@
       "optional": true
     }
   },
-  "dependencies": {
-    "@breezystack/lamejs": "^1.2.7"
-  },
   "devDependencies": {
-    "@deepseek-ai/cordis": "4.1.0",
-    "@deepseek-ai/dsh-host-webserver": "0.0.1-rc.1",
-    "@deepseek-ai/schemastery": "3.19.0",
     "@types/node": "26.6.6",
     "@types/react": "18.3.31",
     "react": "18.3.1",
@@ -81,11 +76,11 @@
     "audio",
     "recording",
     "microphone",
-    "mp3"
+    "voice"
   ],
   "scripts": {
     "build": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
-    "typecheck": "tsc -p tsconfig.json",
-    "test": "node test/client.factory.test.mjs && node test/encoders.test.mjs && node test/save-route.test.mjs"
+    "typecheck": "tsc -p tsconfig.client.json",
+    "test": "node test/client.factory.test.mjs"
   }
 }

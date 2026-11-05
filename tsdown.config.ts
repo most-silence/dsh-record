@@ -1,9 +1,10 @@
 /**
  * tsdown preset for the dsh-record plugin.
- * Node half: ESM entry (lib/index.js) with Config schema + web routes.
+ * Node half: dependency-free ESM entry (lib/index.js) — no Config schema, no
+ * web routes, so a bad schema can never abort profile startup again.
  * Browser half: a single CJS classic script (lib/client.js) wrapped for the
- * harness client-plugin loader; lamejs is bundled inline, host modules stay
- * external (resolved from the loader's frozen module table at runtime).
+ * harness client-plugin loader; host modules stay external (resolved from the
+ * loader's frozen module table at runtime).
  * @see dsh-plugin-developer-skill references/build-test.md
  */
 import type { UserConfig } from 'tsdown'
@@ -30,14 +31,6 @@ export default [
     fixedExtension: false,
     dts: true,
     clean: true,
-    deps: {
-      // schemastery stays unbundled because the Loader validates the plugin's
-      // `Config` schema and must see its own instance; cordis is type-only here.
-      neverBundle: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
-    },
-    // tsdown 0.19 ignores deps.neverBundle for the node entry; `external`
-    // is the option that actually keeps schemastery as a runtime import.
-    external: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
   },
   {
     // Browser bundle: lib/client.js, served by the harness at /plugins/dsh-record/client.js.
