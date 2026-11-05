@@ -70,6 +70,7 @@ function loadModule(sandboxExtras = {}) {
     require: (id) => {
       if (id === 'react') return react
       if (id === 'react/jsx-runtime') return jsx
+      if (id === '@breezystack/lamejs') return { default: { Mp3Encoder: class { encodeBuffer() { return new Uint8Array(0) } flush() { return new Uint8Array(0) } } } }
       throw new Error(`unexpected require(${id})`)
     },
     navigator: { mediaDevices: undefined },

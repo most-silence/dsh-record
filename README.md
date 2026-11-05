@@ -2,18 +2,23 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A DeepSeek Harness (dsh) plugin that puts a microphone button in the composer: click to record, click again to stop, and the recording is attached to your current prompt as a conversation file attachment.
+A DeepSeek Harness (dsh) plugin that puts a microphone button in the composer with a format selector: record audio in **MP3** (default), **WAV**, or **WebM**, and attach it to your current prompt as a conversation file attachment.
 
 [中文文档](README.zh.md)
 
 ## Features
 
-- **Composer microphone button** — registered at the `conversation.input.right` slot, before the submit action. No floating widgets; coexists with `dsh-talk` / `dsh-stt` (which use the left slot).
-- **Real-time recording** — browser `MediaRecorder`, webm/opus preferred with capability-based fallback. Elapsed timer and live file-name preview while recording (`rec-YYYYMMDD-HHMMSS-<n>s.webm`).
-- **Prompt attachment** — on stop, the recording is registered through the host draft-attachment channel (`conversation.createDrafts` + `inputActions.addAttachments`) and appears as a composer file card with upload progress. It then rides the normal upload queue with your prompt.
+- **Composer microphone button + format selector** — registered at the `conversation.input.right` slot, before the submit action. A dropdown lets you pick MP3 / WAV / WebM; the choice persists across page reloads via localStorage.
+- **Real-time recording** — browser `MediaRecorder`, webm/opus preferred with capability-based fallback. Elapsed timer and live file-name preview while recording (`rec-YYYYMMDD-HHMMSS-<n>s.mp3`).
+- **Three output formats**:
+  - **MP3** (default) — decoded from the browser's native container, then encoded via lamejs (128 kbps CBR) entirely in the browser. No server-side dependencies.
+  - **WAV** — lossless 16-bit PCM, decoded and re-wrapped in the browser.
+  - **WebM** — the browser's native Opus container, no transcoding needed. Smallest file, fastest attach.
+- **Prompt attachment** — on stop, the (optionally transcoded) file is registered through the host draft-attachment channel (`conversation.createDrafts` + `inputActions.addAttachments`) and appears as a composer file card with upload progress.
+- **Graceful fallback** — if MP3/WAV transcoding fails (e.g. OfflineAudioContext unavailable), the raw WebM is attached instead so the recording is never lost.
 - **Cancel discipline** — Escape, the ✕ button, or leaving the tab discards the recording; recordings under 0.5 s are dropped; a stop during an in-flight submit releases the draft cleanly.
 
-The plugin records and attaches. It does not transcribe, transcode, or write files to disk — send the attachment to your model, or pair it with a speech-to-text plugin such as `dsh-stt`.
+The plugin records, optionally transcodes, and attaches. It does not write files to disk or perform speech recognition — pair it with `dsh-stt` for transcription.
 
 ## Install
 
@@ -29,19 +34,20 @@ Restart the dsh host after installing, then refresh the web page.
 
 ```
 browser half (lib/client.js)               host half (lib/index.js)
-├─ mic button @ conversation.input.right   └─ no-op shell: a valid `main`
+├─ mic button + format dropdown            └─ no-op shell: a valid `main`
 ├─ MediaRecorder → webm/opus                  entry that registers nothing
+├─ decode → lamejs (mp3) / PCM wrap (wav)
 └─ attach via createDrafts + addAttachments
 ```
 
-The host half is deliberately dependency-free and declares no `Config` schema: an earlier mp3/disk-save iteration added a schemastery schema whose API mismatch aborted the whole profile at startup. Keeping the node half empty means the plugin can never block boot.
+The host half is deliberately dependency-free and declares no `Config` schema. Format selection is persisted in the browser via localStorage (`dsh-record.format`). This design avoids the schemastery API mismatch that caused profile startup failures in earlier versions.
 
 ## Development
 
 ```bash
 npm install
 npm run build     # tsdown: lib/index.js (ESM) + lib/client.js (CJS, ModuleLoader-wrapped)
-npm test          # 7 node:test cases: client factory contract + attachment flow
+npm test          # 12 node:test cases: client factory contract (7) + encoders (5)
 ```
 
 Tests run with Node 24 (native TypeScript type stripping); no browser needed.
@@ -49,8 +55,9 @@ Tests run with Node 24 (native TypeScript type stripping); no browser needed.
 ## Known limitations
 
 - The attachment channel relies on host client contracts verified on dsh 0.2.1-rc.2 (`conversation.input.right` slot, `createDrafts` / `addAttachments`). Upstream changes may degrade to an inline error notice.
+- MP3/WAV transcoding runs after you press stop (not during capture), so very long recordings add a brief encode pause.
 - Recording requires a microphone-permission grant; the page must be served over HTTPS or localhost.
-- Audio is attached in the browser's native container (usually WebM/Opus). Transcoding to MP3 or WAV is not part of this version.
+- Format preference is stored in localStorage per-origin; clearing browser data resets it to MP3.
 
 ## License
 

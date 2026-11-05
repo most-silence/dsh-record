@@ -1,26 +1,23 @@
 /**
- * dsh-record — browser half (0.1.0 behavior restored).
+ * dsh-record — browser half (v0.3.0: three-format recording).
  *
- * 输入框右侧（`conversation.input.right` 座位）的麦克风按钮：
- *   - 点击开始实时录音（MediaRecorder，webm/opus 优先，按浏览器能力回退）。
+ * 输入框右侧（`conversation.input.right` 座位）的麦克风按钮 + 格式选择器：
+ *   - 支持 mp3（默认，浏览器端 lamejs 转码）、wav（16-bit PCM 无损）、
+ *     webm（浏览器原生 Opus，不转码）。
+ *   - 格式选择持久化到 localStorage（key: `dsh-record.format`），刷新后保持。
  *   - 录音中显示计时；文件名按「结尾时间 + 时长」实时预览，
- *     例如 `rec-20261104-214711-4s.webm`。
- *   - 再次点击（停止）：把录音组装成 File，走宿主真实的会话附件通道 —
- *     `conversation.createDrafts(sessionId, [file])` 登记并启动上传，
- *     `inputActions.addAttachments(ids)` 挂进当前草稿，随 Prompt 一起发送。
- *   - 不转码、不落盘、不做语音识别；Esc / ✕ / 切走标签页 = 丢弃录音。
+ *     例如 `rec-20261104-214711-4s.mp3`。
+ *   - 停止后：webm 直接附加；mp3/wav 先解码再转码，然后走宿主附件通道。
+ *   - 转码失败时自动回退附加原始 webm，不让录音丢失。
+ *   - Esc / ✕ / 切走标签页 = 丢弃录音。
  *
- * 这是 2026-11-04 21:47 实测可用的 0.1.0 行为（当时录音成功附加并发送）。
- * 后续引入的 MP3/WAV 转码与落盘路由在 pre-rollback 分支保留，可随时找回。
- *
- * 依赖的宿主契约（0.2.1-rc.2 实测）：
- *   - slot `conversation.input.right`：list / session，由 ui-conversation 声明；
- *   - session scope props：`sessionId`（ui-session）、`inputActions`
- *     （ui-conversation 经 uiSession.provide 注入，`addAttachments(ids)`）；
- *   - root service `conversation`（createDrafts / releaseDraftAttachments）。
+ * **安全设计**：宿主半保持空壳（无 Config schema、无路由），格式配置完全
+ * 在浏览器端用 localStorage 管理。这彻底规避了 schemastery API 不匹配
+ * 导致 profile 启动失败的风险（2026-11-04 事故根因）。
  *
  * @module dsh-record/client
  */
+import { encodeMp3, encodeWav, EXT_BY_FORMAT, type AudioData, type RecordFormat } from './encoders'
 
 const React = require('react') as any
 const { useState, useEffect, useRef, useCallback } = React
@@ -28,12 +25,29 @@ const { useState, useEffect, useRef, useCallback } = React
 export const name = 'dsh-record'
 export const inject = ['slots']
 
-// ---- 文件名：结尾时间 + 时长 ------------------------------------------------
+// ---- 格式配置（localStorage 持久化） ----------------------------------------
+const STORAGE_KEY = 'dsh-record.format'
+const VALID_FORMATS: RecordFormat[] = ['mp3', 'wav', 'webm']
+
+function loadFormat(): RecordFormat {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null
+    if (raw && VALID_FORMATS.includes(raw as RecordFormat)) return raw as RecordFormat
+  } catch { /* localStorage 不可用 */ }
+  return 'mp3'
+}
+
+function saveFormat(fmt: RecordFormat): void {
+  try {
+    if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, fmt)
+  } catch { /* 忽略 */ }
+}
+
+// ---- 文件名 ----------------------------------------------------------------
 function pad2(n: number): string {
   return String(n).padStart(2, '0')
 }
 
-/** `rec-YYYYMMDD-HHMMSS-<n>s.<ext>` — 结尾时间为停止那一刻的本地时间。 */
 export function buildFileName(end: Date, durationMs: number, ext: string): string {
   const secs = Math.max(1, Math.round(durationMs / 1000))
   const stamp =
@@ -49,7 +63,7 @@ function fmtElapsed(ms: number): string {
   return `${m}:${pad2(s)}`
 }
 
-// ---- 原生编码选择 ------------------------------------------------------------
+// ---- 原生编码选择 ----------------------------------------------------------
 const EXT_BY_MIME: Record<string, string> = {
   'audio/webm': 'webm',
   'audio/ogg': 'ogg',
@@ -57,7 +71,6 @@ const EXT_BY_MIME: Record<string, string> = {
   'audio/mpeg': 'mp3',
 }
 
-/** 优先 webm/opus（Chromium/Edge 全支持），依次回退。 */
 function pickMime(): string {
   const MR: any = (globalThis as any).MediaRecorder
   if (typeof MR !== 'function' || typeof MR.isTypeSupported !== 'function') return ''
@@ -65,9 +78,7 @@ function pickMime(): string {
   for (const c of cands) {
     try {
       if (MR.isTypeSupported(c)) return c
-    } catch {
-      /* 忽略：继续下一候选 */
-    }
+    } catch { /* skip */ }
   }
   return ''
 }
@@ -79,26 +90,30 @@ function extOf(mime: string): string {
   return 'webm'
 }
 
-// ---- 录音状态机（组件内） ----------------------------------------------------
-type Phase = 'idle' | 'recording' | 'stopping'
-
-interface SessionProps {
-  /** session 座位标准 props（ui-conversation 经 uiSession.provide 注入）。 */
-  sessionId?: string
-  /** 会话输入框动作面；`addAttachments` 在提交/裁定中返回 false。 */
-  inputActions?: {
-    addAttachments(ids: string[]): boolean
-  }
-  /**
-   * 由 register({inject}) 注入的宿主附件原语：把录音登记为草稿附件并挂进
-   * 该会话的输入框。成功返回 null，失败返回给用户看的一句话。
-   */
-  attachRecording?: (sessionId: string, blob: Blob, name: string) => string | null
+// ---- 转码 ------------------------------------------------------------------
+async function decodeAudio(blob: Blob): Promise<AudioData> {
+  const OAC: any = (globalThis as any).OfflineAudioContext
+  if (typeof OAC !== 'function') throw new Error('OfflineAudioContext unavailable')
+  const bytes = await blob.arrayBuffer()
+  const ctx = new OAC(1, 1, 44100)
+  return await ctx.decodeAudioData(bytes)
 }
 
-/** 最小内联样式：一次注入，颜色全部走 dsw 主题变量并带回退。 */
+async function transcode(blob: Blob, format: RecordFormat): Promise<Blob> {
+  if (format === 'webm') return blob
+  const audio = await decodeAudio(blob)
+  const bytes = format === 'mp3' ? encodeMp3(audio) : encodeWav(audio)
+  const type = format === 'mp3' ? 'audio/mpeg' : 'audio/wav'
+  return new Blob([bytes as any], { type })
+}
+
+// ---- 样式 ------------------------------------------------------------------
 const CSS = `
-[data-dsh-record-seat]{position:relative;display:inline-flex;align-items:center;gap:2px;}
+[data-dsh-record-seat]{position:relative;display:inline-flex;align-items:center;gap:4px;}
+[data-dsh-record-select]{height:26px;padding:0 4px;border:1px solid var(--dsw-alias-border-l1,#444);
+  border-radius:6px;background:var(--dsw-alias-bg-overlay,#2a2a2a);color:var(--dsw-alias-label-primary,#eee);
+  font:inherit;font-size:12px;cursor:pointer;outline:none;}
+[data-dsh-record-select]:focus{border-color:var(--dsw-alias-state-info-primary,#52a9ff);}
 [data-dsh-record-mic],[data-dsh-record-stop]{display:inline-flex;align-items:center;gap:5px;
   height:26px;padding:0 7px;border:1px solid transparent;border-radius:6px;background:transparent;
   color:var(--dsw-alias-label-secondary,#8a8a8a);font:inherit;font-size:12px;cursor:pointer;}
@@ -123,6 +138,7 @@ function ensureCss() {
   document.head.appendChild(style)
 }
 
+// ---- Icons -----------------------------------------------------------------
 const MicIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
     strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -138,12 +154,27 @@ const StopIcon = () => (
   </svg>
 )
 
+// ---- Component -------------------------------------------------------------
+type Phase = 'idle' | 'recording' | 'stopping'
+
+interface SessionProps {
+  sessionId?: string
+  inputActions?: { addAttachments(ids: string[]): boolean }
+  attachRecording?: (
+    sessionId: string,
+    blob: Blob,
+    name: string,
+    addAttachments: (ids: string[]) => boolean,
+  ) => string | null
+}
+
 function RecordButton(props: SessionProps) {
-  const { sessionId, inputActions } = props
+  const { sessionId } = props
   const [phase, setPhase] = useState('idle' as Phase)
   const [elapsed, setElapsed] = useState(0)
   const [note, setNote] = useState(null as { text: string; tone: 'err' | 'ok' } | null)
   const [liveName, setLiveName] = useState('')
+  const [format, setFormat] = useState(loadFormat)
 
   const streamRef = useRef(null as any)
   const recorderRef = useRef(null as any)
@@ -169,7 +200,7 @@ function RecordButton(props: SessionProps) {
     recorderRef.current = null
     if (stream) {
       for (const track of stream.getTracks ? stream.getTracks() : []) {
-        try { track.stop() } catch { /* 已停止 */ }
+        try { track.stop() } catch { /* stopped */ }
       }
     }
   }, [])
@@ -191,6 +222,14 @@ function RecordButton(props: SessionProps) {
       setPhase('idle')
     }
   }, [releaseMic])
+
+  const onFormatChange = useCallback((e: any) => {
+    const val = e.target.value as RecordFormat
+    if (VALID_FORMATS.includes(val)) {
+      setFormat(val)
+      saveFormat(val)
+    }
+  }, [])
 
   const start = useCallback(async () => {
     ensureCss()
@@ -217,10 +256,9 @@ function RecordButton(props: SessionProps) {
       showNote(denied ? '麦克风权限被拒绝' : '无法打开麦克风', 'err')
       return
     }
-    // await 期间组件被卸载/座位消失：立刻归还麦克风，不开新录音。
     if (disposedRef.current) {
       for (const track of stream.getTracks()) {
-        try { track.stop() } catch { /* 已停止 */ }
+        try { track.stop() } catch { /* stopped */ }
       }
       startingRef.current = false
       return
@@ -237,7 +275,7 @@ function RecordButton(props: SessionProps) {
       } catch (err: any) {
         startingRef.current = false
         releaseMic()
-        showNote(`录音器创建失败：${err && err.message ? err.message : String(err)}`, 'err')
+        showNote(`录音器创建失败：${err?.message ?? String(err)}`, 'err')
         return
       }
     }
@@ -245,7 +283,7 @@ function RecordButton(props: SessionProps) {
     recorder.ondataavailable = (e: any) => {
       if (e.data && e.data.size > 0) chunksRef.current.push(e.data)
     }
-    recorder.onstop = () => {
+    recorder.onstop = async () => {
       if (timerRef.current) {
         clearInterval(timerRef.current)
         timerRef.current = null
@@ -261,18 +299,46 @@ function RecordButton(props: SessionProps) {
         finish()
         return
       }
-      const blob = new Blob(chunks, { type })
+      const rawBlob = new Blob(chunks, { type })
       if (!attachedRef.current) {
         attachedRef.current = true
-        if (blob.size === 0 || durationMs < 500) {
+        if (rawBlob.size === 0 || durationMs < 500) {
           showNote('录音太短，已丢弃', 'err')
-        } else if (sessionId === undefined || props.attachRecording === undefined || inputActions === undefined) {
-          showNote('当前页面没有可用会话，无法附加录音', 'err')
-        } else {
-          const name = buildFileName(new Date(), durationMs, extOf(type))
-          const err = props.attachRecording(sessionId, blob, name, (ids) => inputActions.addAttachments(ids))
-          showNote(err === null ? `已附加 ${name}` : err, err === null ? 'ok' : 'err')
+          finish()
+          return
         }
+        if (sessionId === undefined || props.attachRecording === undefined || props.inputActions === undefined) {
+          showNote('当前页面没有可用会话，无法附加录音', 'err')
+          finish()
+          return
+        }
+        // Transcode if needed
+        const currentFormat = loadFormat() // re-read in case user changed mid-recording
+        let targetBlob = rawBlob
+        let targetExt = extOf(type)
+        let transcoded = false
+        if (currentFormat !== 'webm') {
+          try {
+            targetBlob = await transcode(rawBlob, currentFormat)
+            targetExt = currentFormat
+            transcoded = true
+          } catch (err: any) {
+            // Fallback to raw webm
+            targetExt = 'webm'
+            showNote(`${currentFormat} 转码失败（${err?.message ?? String(err)}），已附加原始 webm`, 'err')
+          }
+        }
+        const name = buildFileName(new Date(), durationMs, targetExt)
+        const err = props.attachRecording(
+          sessionId,
+          targetBlob,
+          name,
+          (ids) => props.inputActions!.addAttachments(ids),
+        )
+        const msg = err === null
+          ? `已附加 ${name}${transcoded ? '' : ' (原始webm)'}`
+          : err
+        showNote(msg, err === null ? 'ok' : 'err')
       }
       finish()
     }
@@ -292,7 +358,7 @@ function RecordButton(props: SessionProps) {
       } catch (err: any) {
         startingRef.current = false
         releaseMic()
-        showNote(`录音启动失败：${err && err.message ? err.message : String(err)}`, 'err')
+        showNote(`录音启动失败：${err?.message ?? String(err)}`, 'err')
         return
       }
     }
@@ -304,7 +370,7 @@ function RecordButton(props: SessionProps) {
       setElapsed(dur)
       setLiveName(buildFileName(new Date(now), dur, ext))
     }, 500)
-  }, [phase, sessionId, inputActions, props.attachRecording, releaseMic, showNote])
+  }, [phase, sessionId, props.attachRecording, props.inputActions, releaseMic, showNote])
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current
@@ -317,7 +383,7 @@ function RecordButton(props: SessionProps) {
     }
   }, [releaseMic])
 
-  // Escape 取消当前录音（官方 voice-input 的同款纪律）。
+  // Escape cancels recording
   useEffect(() => {
     if (phase !== 'recording') return
     const onKey = (e: KeyboardEvent) => {
@@ -332,7 +398,7 @@ function RecordButton(props: SessionProps) {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [phase, abort, showNote])
 
-  // 页面切到后台时取消录音，避免幽灵采集。
+  // Tab hidden cancels recording
   useEffect(() => {
     if (phase !== 'recording') return
     const onVis = () => {
@@ -346,12 +412,21 @@ function RecordButton(props: SessionProps) {
   }, [phase, abort, showNote])
 
   const recording = phase === 'recording' || phase === 'stopping'
-  const seatTitle = recording
-    ? liveName ? `停止录音并附加为 ${liveName}（Esc 取消）` : '停止录音并附加（Esc 取消）'
-    : 'Record / 录音'
 
   return (
     <span {...{ 'data-dsh-record-seat': '' }}>
+      {/* Format selector — disabled during recording */}
+      <select
+        {...{ 'data-dsh-record-select': '', 'aria-label': '录音格式' }}
+        value={format}
+        onChange={onFormatChange}
+        disabled={recording}
+      >
+        <option value="mp3">MP3</option>
+        <option value="wav">WAV</option>
+        <option value="webm">WebM</option>
+      </select>
+
       {recording ? (
         <button
           type="button"
@@ -363,7 +438,11 @@ function RecordButton(props: SessionProps) {
       ) : null}
       <button
         type="button"
-        {...{ 'data-dsh-record-mic': '', 'data-recording': recording ? '1' : '0', 'aria-label': '录音', title: seatTitle }}
+        {...{ 'data-dsh-record-mic': '', 'data-recording': recording ? '1' : '0', 'aria-label': '录音',
+          title: recording
+            ? (liveName ? `停止并处理为 ${liveName}（Esc 取消）` : '停止录音并处理（Esc 取消）')
+            : 'Record / 录音'
+        }}
         onClick={recording ? stop : start}
         disabled={!recording && (sessionId === undefined || props.attachRecording === undefined)}
       >
@@ -375,25 +454,16 @@ function RecordButton(props: SessionProps) {
   )
 }
 
-// ---- 装配 --------------------------------------------------------------------
+// ---- Assembly --------------------------------------------------------------
 export function apply(ctx: any): void {
   ensureCss()
   const slots = ctx.slots
-  // 等 ui-conversation 挂出 conversation 服务后再注册座位，避免加载顺序竞态
-  // （与 dsh-talk 同款范式：ctx.inject(['conversation'], scope => ...)）。
   ctx.inject(['conversation'], (scope: any) => {
     const conversation = scope.get('conversation')
     if (conversation === undefined || typeof conversation.createDrafts !== 'function') {
       console.warn('[dsh-record] conversation 服务不可用，麦克风入口不会注册')
       return
     }
-    /**
-     * 登记录音为草稿附件，再通过会话输入框的 `addAttachments` 挂进草稿。
-     *
-     * 复刻宿主 InputBar 的 addFiles 流程：`createDrafts` 登记并立即启动上传；
-     * `addAttachments` 被拒（正在提交/裁定）时释放附件，避免留下孤儿上传。
-     * `addAttachments` 来自会话座位的 inputActions（组件 props），由组件回调传入。
-     */
     const attachRecording = (
       sessionId: string,
       blob: Blob,
@@ -412,9 +482,9 @@ export function apply(ctx: any): void {
         return null
       } catch (err: any) {
         if (drafts.length > 0) {
-          try { conversation.releaseDraftAttachments(drafts) } catch { /* 已释放 */ }
+          try { conversation.releaseDraftAttachments(drafts) } catch { /* released */ }
         }
-        return `附加失败：${err && err.message ? err.message : String(err)}`
+        return `附加失败：${err?.message ?? String(err)}`
       }
     }
     slots.inject('conversation.input.right', () =>
