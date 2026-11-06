@@ -15,6 +15,7 @@ const PLUGIN_ID = 'dsh-record'
 const PLATFORM_MODULES = [
   'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-slots',
+  '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-client-ui-conversation',
 ] as const
 
@@ -31,6 +32,11 @@ export default [
     fixedExtension: false,
     dts: true,
     clean: true,
+    // The host provides schemastery and cordis at runtime. Bundling a private
+    // copy of schemastery would make the Config schema incompatible with the
+    // host's validator (and previously aborted profile startup), so both stay
+    // external. Nothing else may be externalized here.
+    external: ['@deepseek-ai/schemastery', '@deepseek-ai/cordis'],
   },
   {
     // Browser bundle: lib/client.js, served by the harness at /plugins/dsh-record/client.js.
@@ -41,8 +47,15 @@ export default [
     dts: false,
     clean: false,
     deps: {
+      // Only platform modules stay external (resolved from the loader's frozen
+      // module table). Everything else — including @breezystack/lamejs — must
+      // be bundled inline because the DSH module table does not include it.
       neverBundle: [...CLIENT_EXTERNALS],
     },
+    // Force lamejs to be bundled inline. The DSH module table does not include
+    // it, so any require("@breezystack/lamejs") at runtime will fail with
+    // "missed the module table".
+    noExternal: ['@breezystack/lamejs'],
     define: {
       'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'production'),
     },

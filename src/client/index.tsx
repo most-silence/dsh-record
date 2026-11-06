@@ -1,46 +1,95 @@
 /**
- * dsh-record — browser half (v0.3.0: three-format recording).
+ * dsh-record — browser half (v0.4.0).
  *
- * 输入框右侧（`conversation.input.right` 座位）的麦克风按钮 + 格式选择器：
- *   - 支持 mp3（默认，浏览器端 lamejs 转码）、wav（16-bit PCM 无损）、
- *     webm（浏览器原生 Opus，不转码）。
- *   - 格式选择持久化到 localStorage（key: `dsh-record.format`），刷新后保持。
- *   - 录音中显示计时；文件名按「结尾时间 + 时长」实时预览，
- *     例如 `rec-20261104-214711-4s.mp3`。
- *   - 停止后：webm 直接附加；mp3/wav 先解码再转码，然后走宿主附件通道。
- *   - 转码失败时自动回退附加原始 webm，不让录音丢失。
- *   - Esc / ✕ / 切走标签页 = 丢弃录音。
- *
- * **安全设计**：宿主半保持空壳（无 Config schema、无路由），格式配置完全
- * 在浏览器端用 localStorage 管理。这彻底规避了 schemastery API 不匹配
- * 导致 profile 启动失败的风险（2026-11-04 事故根因）。
+ * 输入框右侧（`conversation.input.right` 座位）的麦克风按钮：
+ *   - 录音（webm/opus 原生采集）→ 按配置的格式转码 → 会话附件挂进输入框。
+ *   - **格式在插件设置页（Loader Config）选择**：mp3（默认）/ wav / webm。
+ *     客户端启动时 fetch `GET /dsh-record/config` 读宿主解析后的配置；
+ *     路由不可达时回退 mp3。composer 座位上不摆格式下拉框。
+ *   - 悬停提示跟随界面语言：locale 服务注册 zh/en 词典，中文界面显示
+ *     "录音"，英文界面显示 "Record"（宿主 locale 切换时自动重渲染）。
+ *   - 录音中显示计时；文件名「结尾时间 + 时长」实时预览。
+ *   - 转码失败自动附加原始 webm；Esc / ✕ / 切走标签页 = 丢弃。
  *
  * @module dsh-record/client
  */
-import { encodeMp3, encodeWav, EXT_BY_FORMAT, type AudioData, type RecordFormat } from './encoders'
+import { encodeMp3, encodeWav, type AudioData, type RecordFormat } from './encoders'
+import {
+  RecordSettingsCard,
+  createRecordCardController,
+  dictionaries as settingsDictionaries,
+  ENTRY_ID,
+  NS as SETTINGS_NS,
+} from './settings'
+
+// 设置页组件对外导出，便于测试与潜在复用。
+export { RecordSettingsCard } from './settings'
 
 const React = require('react') as any
 const { useState, useEffect, useRef, useCallback } = React
 
 export const name = 'dsh-record'
-export const inject = ['slots']
+export const inject = ['slots', 'locale']
 
-// ---- 格式配置（localStorage 持久化） ----------------------------------------
-const STORAGE_KEY = 'dsh-record.format'
-const VALID_FORMATS: RecordFormat[] = ['mp3', 'wav', 'webm']
+/** 包名 = `plugins.bundle.config` 的 key，也是 profile 里的 bundle 名。 */
+const PACKAGE_NAME = 'dsh-record'
 
-function loadFormat(): RecordFormat {
-  try {
-    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY) : null
-    if (raw && VALID_FORMATS.includes(raw as RecordFormat)) return raw as RecordFormat
-  } catch { /* localStorage 不可用 */ }
-  return 'mp3'
+// ---- locale 词典（zh/en 双份；宿主 locale 服务按界面语言挑选） --------------
+const NS = 'dsh-record'
+const zh = {
+  mic: '录音',
+  stop: '停止',
+  cancel: '取消录音（丢弃，不附加）',
+  cancelDone: '已取消录音',
+  stopHint: 'Esc 取消',
+  attached: '已附加',
+  tooShort: '录音太短，已丢弃',
+  noSession: '当前页面没有可用会话，无法处理录音',
+  transcodeFailed: '转码失败，已附加原始 webm',
+  deviceError: '录音设备出错',
+  leavePage: '页面离开，已取消录音',
+  notSupported: '当前环境不支持录音（无 getUserMedia / MediaRecorder）',
+  micDenied: '麦克风权限被拒绝',
+  micUnavailable: '无法打开麦克风',
+  recorderFail: '录音器创建失败',
+  startFail: '录音启动失败',
+  submitting: '正在提交，稍后再试（录音未附加）',
+  attachFailed: '附加失败',
+}
+const en = {
+  mic: 'Record',
+  stop: 'Stop',
+  cancel: 'Cancel recording (discard, nothing attached)',
+  cancelDone: 'Recording cancelled',
+  stopHint: 'Esc to cancel',
+  attached: 'Attached',
+  tooShort: 'Recording too short, discarded',
+  noSession: 'No session available on this page, cannot attach',
+  transcodeFailed: 'transcode failed, attached the original webm',
+  deviceError: 'Recording device error',
+  leavePage: 'Page left, recording cancelled',
+  notSupported: 'Recording is not supported here (no getUserMedia / MediaRecorder)',
+  micDenied: 'Microphone permission denied',
+  micUnavailable: 'Could not open the microphone',
+  recorderFail: 'Failed to create the recorder',
+  startFail: 'Failed to start recording',
+  submitting: 'Submitting now — try again later (nothing attached)',
+  attachFailed: 'Attach failed',
 }
 
-function saveFormat(fmt: RecordFormat): void {
+// ---- 宿主配置读取（格式在插件设置页选择） -----------------------------------
+export async function loadHostFormat(timeoutMs = 3000): Promise<RecordFormat> {
   try {
-    if (typeof localStorage !== 'undefined') localStorage.setItem(STORAGE_KEY, fmt)
-  } catch { /* 忽略 */ }
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+    const res = await fetch('/dsh-record/config', { signal: ctrl.signal })
+    clearTimeout(timer)
+    const data: any = await res.json()
+    if (data && data.ok && (data.format === 'mp3' || data.format === 'wav' || data.format === 'webm')) {
+      return data.format as RecordFormat
+    }
+  } catch { /* 路由不可达/超时：回退默认 */ }
+  return 'mp3'
 }
 
 // ---- 文件名 ----------------------------------------------------------------
@@ -63,7 +112,7 @@ function fmtElapsed(ms: number): string {
   return `${m}:${pad2(s)}`
 }
 
-// ---- 原生编码选择 ----------------------------------------------------------
+// ---- 原生容器选择（转码由 encoders 做） --------------------------------------
 const EXT_BY_MIME: Record<string, string> = {
   'audio/webm': 'webm',
   'audio/ogg': 'ogg',
@@ -109,11 +158,7 @@ async function transcode(blob: Blob, format: RecordFormat): Promise<Blob> {
 
 // ---- 样式 ------------------------------------------------------------------
 const CSS = `
-[data-dsh-record-seat]{position:relative;display:inline-flex;align-items:center;gap:4px;}
-[data-dsh-record-select]{height:26px;padding:0 4px;border:1px solid var(--dsw-alias-border-l1,#444);
-  border-radius:6px;background:var(--dsw-alias-bg-overlay,#2a2a2a);color:var(--dsw-alias-label-primary,#eee);
-  font:inherit;font-size:12px;cursor:pointer;outline:none;}
-[data-dsh-record-select]:focus{border-color:var(--dsw-alias-state-info-primary,#52a9ff);}
+[data-dsh-record-seat]{position:relative;display:inline-flex;align-items:center;gap:2px;}
 [data-dsh-record-mic],[data-dsh-record-stop]{display:inline-flex;align-items:center;gap:5px;
   height:26px;padding:0 7px;border:1px solid transparent;border-radius:6px;background:transparent;
   color:var(--dsw-alias-label-secondary,#8a8a8a);font:inherit;font-size:12px;cursor:pointer;}
@@ -166,15 +211,19 @@ interface SessionProps {
     name: string,
     addAttachments: (ids: string[]) => boolean,
   ) => string | null
+  /** 读宿主配置（插件设置页选择的格式）。async：首次触发 fetch，之后走缓存。 */
+  getFormat?: () => Promise<RecordFormat>
+  /** locale 绑定（跟随界面语言）。 */
+  t?: (key: string) => string
 }
 
 function RecordButton(props: SessionProps) {
   const { sessionId } = props
+  const t = props.t ?? ((key: string) => (zh as Record<string, string>)[key] ?? key)
   const [phase, setPhase] = useState('idle' as Phase)
   const [elapsed, setElapsed] = useState(0)
   const [note, setNote] = useState(null as { text: string; tone: 'err' | 'ok' } | null)
   const [liveName, setLiveName] = useState('')
-  const [format, setFormat] = useState(loadFormat)
 
   const streamRef = useRef(null as any)
   const recorderRef = useRef(null as any)
@@ -223,14 +272,6 @@ function RecordButton(props: SessionProps) {
     }
   }, [releaseMic])
 
-  const onFormatChange = useCallback((e: any) => {
-    const val = e.target.value as RecordFormat
-    if (VALID_FORMATS.includes(val)) {
-      setFormat(val)
-      saveFormat(val)
-    }
-  }, [])
-
   const start = useCallback(async () => {
     ensureCss()
     if (phase !== 'idle' || startingRef.current) return
@@ -241,7 +282,7 @@ function RecordButton(props: SessionProps) {
     const MR: any = (globalThis as any).MediaRecorder
     if (!md || typeof md.getUserMedia !== 'function' || typeof MR !== 'function') {
       startingRef.current = false
-      showNote('当前环境不支持录音（无 getUserMedia / MediaRecorder）', 'err')
+      showNote(t('notSupported'), 'err')
       return
     }
     let stream: any
@@ -253,7 +294,7 @@ function RecordButton(props: SessionProps) {
     } catch (err: any) {
       startingRef.current = false
       const denied = err && (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
-      showNote(denied ? '麦克风权限被拒绝' : '无法打开麦克风', 'err')
+      showNote(denied ? t('micDenied') : t('micUnavailable'), 'err')
       return
     }
     if (disposedRef.current) {
@@ -275,7 +316,7 @@ function RecordButton(props: SessionProps) {
       } catch (err: any) {
         startingRef.current = false
         releaseMic()
-        showNote(`录音器创建失败：${err?.message ?? String(err)}`, 'err')
+        showNote(`${t('recorderFail')}: ${err?.message ?? String(err)}`, 'err')
         return
       }
     }
@@ -303,29 +344,27 @@ function RecordButton(props: SessionProps) {
       if (!attachedRef.current) {
         attachedRef.current = true
         if (rawBlob.size === 0 || durationMs < 500) {
-          showNote('录音太短，已丢弃', 'err')
+          showNote(t('tooShort'), 'err')
           finish()
           return
         }
         if (sessionId === undefined || props.attachRecording === undefined || props.inputActions === undefined) {
-          showNote('当前页面没有可用会话，无法附加录音', 'err')
+          showNote(t('noSession'), 'err')
           finish()
           return
         }
-        // Transcode if needed
-        const currentFormat = loadFormat() // re-read in case user changed mid-recording
+        // 插件设置页选择的格式（fetch 失败已在 loadHostFormat 内回退 mp3）
+        const currentFormat = props.getFormat ? await props.getFormat() : 'mp3'
         let targetBlob = rawBlob
         let targetExt = extOf(type)
-        let transcoded = false
+        let transcodeFailed: string | null = null
         if (currentFormat !== 'webm') {
           try {
             targetBlob = await transcode(rawBlob, currentFormat)
             targetExt = currentFormat
-            transcoded = true
           } catch (err: any) {
-            // Fallback to raw webm
             targetExt = 'webm'
-            showNote(`${currentFormat} 转码失败（${err?.message ?? String(err)}），已附加原始 webm`, 'err')
+            transcodeFailed = err?.message ?? String(err)
           }
         }
         const name = buildFileName(new Date(), durationMs, targetExt)
@@ -335,15 +374,17 @@ function RecordButton(props: SessionProps) {
           name,
           (ids) => props.inputActions!.addAttachments(ids),
         )
-        const msg = err === null
-          ? `已附加 ${name}${transcoded ? '' : ' (原始webm)'}`
-          : err
-        showNote(msg, err === null ? 'ok' : 'err')
+        if (err === null) {
+          const base = `${t('attached')} ${name}`
+          showNote(transcodeFailed ? `${base} · ${currentFormat} ${t('transcodeFailed')} (${transcodeFailed})` : base, 'ok')
+        } else {
+          showNote(err, 'err')
+        }
       }
       finish()
     }
     recorder.onerror = () => {
-      showNote('录音设备出错', 'err')
+      showNote(t('deviceError'), 'err')
     }
     recorderRef.current = recorder
     startRef.current = Date.now()
@@ -358,7 +399,7 @@ function RecordButton(props: SessionProps) {
       } catch (err: any) {
         startingRef.current = false
         releaseMic()
-        showNote(`录音启动失败：${err?.message ?? String(err)}`, 'err')
+        showNote(`${t('startFail')}: ${err?.message ?? String(err)}`, 'err')
         return
       }
     }
@@ -370,7 +411,7 @@ function RecordButton(props: SessionProps) {
       setElapsed(dur)
       setLiveName(buildFileName(new Date(now), dur, ext))
     }, 500)
-  }, [phase, sessionId, props.attachRecording, props.inputActions, releaseMic, showNote])
+  }, [phase, sessionId, props.attachRecording, props.inputActions, props.getFormat, t, releaseMic, showNote])
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current
@@ -391,12 +432,12 @@ function RecordButton(props: SessionProps) {
         e.preventDefault()
         e.stopPropagation()
         abort()
-        showNote('已取消录音', 'err')
+        showNote(t('cancelDone'), 'err')
       }
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [phase, abort, showNote])
+  }, [phase, abort, showNote, t])
 
   // Tab hidden cancels recording
   useEffect(() => {
@@ -404,33 +445,24 @@ function RecordButton(props: SessionProps) {
     const onVis = () => {
       if (document.visibilityState === 'hidden') {
         abort()
-        showNote('页面离开，已取消录音', 'err')
+        showNote(t('leavePage'), 'err')
       }
     }
     document.addEventListener('visibilitychange', onVis)
     return () => document.removeEventListener('visibilitychange', onVis)
-  }, [phase, abort, showNote])
+  }, [phase, abort, showNote, t])
 
   const recording = phase === 'recording' || phase === 'stopping'
+  const micTitle = recording
+    ? liveName ? `${t('stop')} → ${liveName}（${t('stopHint')}）` : `${t('stop')}（${t('stopHint')}）`
+    : t('mic')
 
   return (
     <span {...{ 'data-dsh-record-seat': '' }}>
-      {/* Format selector — disabled during recording */}
-      <select
-        {...{ 'data-dsh-record-select': '', 'aria-label': '录音格式' }}
-        value={format}
-        onChange={onFormatChange}
-        disabled={recording}
-      >
-        <option value="mp3">MP3</option>
-        <option value="wav">WAV</option>
-        <option value="webm">WebM</option>
-      </select>
-
       {recording ? (
         <button
           type="button"
-          {...{ 'data-dsh-record-stop': '', 'aria-label': '取消录音', title: '取消录音（丢弃，不附加）' }}
+          {...{ 'data-dsh-record-stop': '', 'aria-label': t('cancel'), title: t('cancel') }}
           onClick={abort}
         >
           ✕
@@ -438,11 +470,7 @@ function RecordButton(props: SessionProps) {
       ) : null}
       <button
         type="button"
-        {...{ 'data-dsh-record-mic': '', 'data-recording': recording ? '1' : '0', 'aria-label': '录音',
-          title: recording
-            ? (liveName ? `停止并处理为 ${liveName}（Esc 取消）` : '停止录音并处理（Esc 取消）')
-            : 'Record / 录音'
-        }}
+        {...{ 'data-dsh-record-mic': '', 'data-recording': recording ? '1' : '0', 'aria-label': t('mic'), title: micTitle }}
         onClick={recording ? stop : start}
         disabled={!recording && (sessionId === undefined || props.attachRecording === undefined)}
       >
@@ -458,6 +486,34 @@ function RecordButton(props: SessionProps) {
 export function apply(ctx: any): void {
   ensureCss()
   const slots = ctx.slots
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-record: dictionaries')
+  // 宿主配置（插件设置页选的格式）：只取一次，Promise 缓存；失败回退 mp3。
+  const hostFormat = loadHostFormat()
+  const t = ctx.locale.bind(NS)
+
+  // ---- 设置页：设置 → 插件 → 点开 dsh-record 详情页 -------------------------
+  // 座位用 `plugins.bundle.config`（keyed by 包名），它渲染在**该 bundle 自己的
+  // 详情页**里（描述与行之间，view: 'page'）；而 `plugins.item` 是平铺列表，
+  // 会把卡片直接堆在内置插件（如终端）下面——那是错的。
+  // 与内置终端插件同款范式：configForms 建表单，whileServed 保证宿主未提供
+  // 该 namespace 时页面上不留痕迹。
+  ctx.inject(['configForms'], (settingsScope: any) => {
+    const configForms = settingsScope.get('configForms')
+    if (configForms === undefined) return
+    const tSettings = ctx.locale.bind(SETTINGS_NS)
+    ctx.effect(() => ctx.locale.register(SETTINGS_NS, settingsDictionaries), 'dsh-record: settings dictionaries')
+    const card = createRecordCardController(configForms)
+    ctx.effect(() => () => card.dispose(), 'dsh-record: settings form subscription')
+    ctx.effect(() => configForms.whileServed([ENTRY_ID], () => slots.inject('plugins.bundle.config', () => slots.register({
+      name: 'plugins.bundle.config',
+      key: PACKAGE_NAME,
+      order: 60,
+      label: () => tSettings('title'),
+      locale: SETTINGS_NS,
+      inject: () => card.inject(),
+    }, RecordSettingsCard))), 'dsh-record: bundle settings page')
+  })
+
   ctx.inject(['conversation'], (scope: any) => {
     const conversation = scope.get('conversation')
     if (conversation === undefined || typeof conversation.createDrafts !== 'function') {
@@ -477,14 +533,14 @@ export function apply(ctx: any): void {
         const ids = drafts.map((draft) => draft.id)
         if (!addAttachments(ids)) {
           conversation.releaseDraftAttachments(drafts)
-          return '正在提交，稍后再试（录音未附加）'
+          return t('submitting')
         }
         return null
       } catch (err: any) {
         if (drafts.length > 0) {
           try { conversation.releaseDraftAttachments(drafts) } catch { /* released */ }
         }
-        return `附加失败：${err?.message ?? String(err)}`
+        return `${t('attachFailed')}: ${err?.message ?? String(err)}`
       }
     }
     slots.inject('conversation.input.right', () =>
@@ -493,8 +549,8 @@ export function apply(ctx: any): void {
           name: 'conversation.input.right',
           id: 'dsh-record',
           order: 10,
-          label: 'dsh-record 录音',
-          inject: () => ({ attachRecording }),
+          label: () => t('mic'),
+          inject: () => ({ attachRecording, getFormat: () => hostFormat, t }),
         },
         RecordButton,
       ),

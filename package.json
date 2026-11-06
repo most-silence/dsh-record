@@ -1,7 +1,7 @@
 {
   "name": "dsh-record",
-  "version": "0.3.0",
-  "description": "Composer microphone button: record audio in MP3 (default), WAV, or WebM and attach it to the current prompt as a conversation file attachment.",
+  "version": "0.5.0",
+  "description": "Composer microphone button: record audio in MP3 (default), WAV, or WebM — both the format and the temporary recording directory are set on the plugin settings page — and attach it to the current prompt as a conversation file attachment.",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -84,6 +84,6 @@
   "scripts": {
     "build": "powershell -ExecutionPolicy Bypass -File scripts/build.ps1",
     "typecheck": "tsc -p tsconfig.client.json",
-    "test": "node test/client.factory.test.mjs && node test/encoders.test.mjs"
+    "test": "node test/client.factory.test.mjs && node test/encoders.test.mjs && node test/settings.test.mjs"
   }
 }
