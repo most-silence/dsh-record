@@ -20,48 +20,70 @@
 - **优雅降级** — 如果 MP3/WAV 转码失败（如 `OfflineAudioContext` 不可用），自动附加原始 WebM，录音不会丢失。
 - **取消纪律** — Esc / ✕ / 切走标签页即丢弃录音；小于 0.5 秒的录音自动丢弃；提交进行中停止会安全释放草稿，不留孤儿上传。
 
-本插件只负责录音、可选转码与附加，不写磁盘文件、不做语音识别——搭配 `dsh-stt` 之类的语音转写插件使用。
+本插件负责录音、可选转码与附加；配置了目录时会同时落盘。不做语音识别——搭配 `dsh-stt` 之类的语音转写插件使用。
 
 ## 安装
 
+### 从插件市场安装（推荐）
+
+直接在插件市场里安装。市场条目指向最新 Release 的预构建包，本机无需编译、也不需要构建工具链。
+
+### 从源码安装
+
+> **`lib/` 构建产物不提交进仓库**（已列入 `.gitignore`）。因此刚 clone 下来的仓库没有 `main` 入口，直接 `dsh plugin add file:<clone>` 会因为找不到 `lib/index.js` 而失败。**请先构建再安装：**
+
 ```bash
 git clone https://github.com/most-silence/dsh-record
-cd dsh-record && npm install && npm run build
+cd dsh-record
+npm install
+npm run build          # 必须：生成 lib/index.js + lib/client.js
 dsh plugin --profile <你的profile> add file:$PWD
+```
+
+不想构建？直接下载 [最新 Release](https://github.com/most-silence/dsh-record/releases/latest) 的 `dsh-record.tgz`（已含 `lib/`）安装：
+
+```bash
+dsh plugin --profile <你的profile> add file:dsh-record.tgz
 ```
 
 安装后重启 dsh 宿主并刷新页面。
 
 ## 配置
 
-「设置 → 插件 → dsh-record」只有一个字段：
+「设置 → 插件 → **dsh-record**」（点开该插件自己的详情页）提供：
 
 | 字段 | 可选值 | 含义 |
 | --- | --- | --- |
-| `format` | `mp3`（默认）· `wav` · `webm` | 输出容器。MP3 与 WAV 在停止时于浏览器端转码；WebM 按采集原样附加。改完需要刷新页面生效（浏览器半在启动时读一次配置）。 |
+| `format` | `mp3`（默认）· `wav` · `webm` | 输出容器。MP3 与 WAV 在停止时于浏览器端转码；WebM 按采集原样附加。下次页面加载生效。 |
+| `dirMode` | `workspace`（默认）· `custom` | 录音写入位置：当前项目空间根目录，或一个固定目录。 |
+| `customDir` | 绝对路径 | `dirMode` 为 `custom` 时使用的目录。录音经同源守卫的宿主路由写入（文件名清洗、拒绝 `..` 穿越、64MB 上限）。 |
+
+`format` 与目录在下次页面加载时生效——浏览器半在启动时读取一次配置。
 
 ## 架构
 
 ```
-浏览器半 (lib/client.js)                    宿主半 (lib/index.js)
-├─ 麦克风按钮 @ conversation.input.right      ├─ Config schema { format: mp3 | wav | webm }
-├─ zh/en 词典 → locale 服务                   └─ GET /dsh-record/config → 下发已解析配置
-├─ MediaRecorder → webm/opus                     （same-origin 守卫）
+浏览器半 (lib/client.js)                       宿主半 (lib/index.js)
+├─ 麦克风按钮 @ conversation.input.right        ├─ Config schema (volatile)
+├─ 设置卡片 @ plugins.bundle.config             │    { format, dirMode, customDir }
+├─ zh/en 词典 → locale 服务                     ├─ GET  /dsh-record/config → 下发配置
+├─ MediaRecorder → webm/opus                    └─ POST /dsh-record/save   → 写入文件
 ├─ 解码 → lamejs (mp3) / PCM 封装 (wav)
 └─ createDrafts + addAttachments 挂附件
 ```
 
-两条加固规则确保插件永远不会拖垮 profile 启动——都是真实事故换来的：
+三条加固规则确保插件永远不会拖垮 profile 启动——都是真实事故换来的：
 
 1. **`@breezystack/lamejs` 强制内联打包。** DSH 的模块表是冻结的，不含 lamejs；若留作构建期 external，运行时 `require("@breezystack/lamejs")` 会找不到模块表条目，导致整个 web boot 失败。`tsdown` 用 `noExternal` 强制内联。
 2. **宿主 `Config` 只用 `z.union([...])`，绝不用 `z.enum([...])`，且 schemastery 保持 `external`。** 宿主那版 schemastery 没有 `enum` 方法；而用打包进来的私有副本构造 schema 会与宿主校验器不兼容——两者任一情况都会在 import 阶段抛错，`dsh-record` 这一行因 `required` 失败，连带整个 profile 起不来。
+3. **schema 标记 `.volatile()`。** 宿主的设置投影只暴露 volatile 字段；普通 schema 完全不渲染表单——这正是早前配置页一片空白的原因。
 
 ## 开发
 
 ```bash
 npm install
 npm run build     # tsdown：lib/index.js (ESM) + lib/client.js (CJS，ModuleLoader 包装)
-npm test          # 14 个 node:test 用例：客户端工厂契约 (9) + 编码器 (5)
+npm test          # 21 个 node:test 用例：工厂契约 (9) + 编码器 (5) + 设置页 (7)
 ```
 
 测试用 Node 24 直接跑（原生 TS 类型剥离），无需浏览器。
@@ -71,7 +93,8 @@ npm test          # 14 个 node:test 用例：客户端工厂契约 (9) + 编码
 - 附件通道依赖在 dsh 0.2.1-rc.2 实测的宿主契约（`conversation.input.right` 座位、`createDrafts` / `addAttachments`）；上游变更时会退化为行内错误提示。
 - MP3/WAV 转码发生在停止之后（非录制中），超长录音会有一小段编码耗时。
 - 录音需要授予麦克风权限；页面需通过 HTTPS 或 localhost 提供。
-- 输出格式存在宿主 profile 配置里（不在浏览器），每次页面加载读取一次，所以在设置页改完需刷新页面生效。
+- 输出格式与目录存在宿主 profile 配置里（不在浏览器），每次页面加载读取一次，所以在设置页改完需刷新页面生效。
+- 自定义目录目前需手动输入路径；应用内「选择文件夹」按钮计划在下个小版本加入。
 
 ## 许可
 
